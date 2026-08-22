@@ -74,7 +74,7 @@ function AIAssistant() {
       // =================================================
 
       const response = await fetch(
-        'http://127.0.0.1:5000/api/chat',
+        'https://click-defense-handle-pilot.trycloudflare.com/api/chat',
         {
           method: 'POST',
 
