@@ -12,21 +12,19 @@ The system allows users to ask questions in natural language and receive answers
 
 ### 🔐 Login
 
-![Login](Frontend/src/assets/login.png.jpeg)
+<img src="./Frontend/src/assets/login.png" alt="Login" width="800"/>
 
 ---
 
 ### 🏠 Dashboard
 
-![Dashboard](Frontend/src/assets/dashboard.png.jpeg)
+<img src="./Frontend/src/assets/dashboard.png" alt="Dashboard" width="800"/>
 
 ---
 
 ### 🤖 AI Assistant
 
-![AI Assistant](Frontend/src/assets/ai-assistant.png.jpeg)
----
-
+<img src="./Frontend/src/assets/ai-assistant.png" alt="AI Assistant" width="800"/>
 ## 🎯 Project Overview
 
 Medication-related information can be difficult and time-consuming to find in long medical documents.
