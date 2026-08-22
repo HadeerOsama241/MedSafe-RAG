@@ -1,251 +1,315 @@
 import os
 import json
-import urllib.request
-import urllib.error
-
+import re
+import requests
 import chromadb
 from sentence_transformers import SentenceTransformer
-from dotenv import load_dotenv
 
 
 # ============================================================
-# LOAD ENVIRONMENT VARIABLES
+# 1. CONFIGURATION
 # ============================================================
 
-load_dotenv()
-
-
 # ============================================================
-# CONFIGURATION
+# CHROMA API KEY — CHANGE THIS LINE LATER
 # ============================================================
+CHROMA_API_KEY = "ck-EA4u5Tb8XfxycCRcTiwYaVYZ9XHojafAjp8pLcVhXH15"
+
+CHROMA_TENANT = "70ff981a-a0e8-4bcc-a0d7-878ba669cfbd"
+CHROMA_DATABASE = "medsafe-rag"
 
 COLLECTION_NAME = "who_medication_safety_day1"
 
-OLLAMA_MODEL = "llama3.2:latest"
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
+OLLAMA_MODEL = "llama3.2:latest"
 
-# Always return up to 5 closest source chunks
-RELEVANCE_TOP_K = 5
-
-# Retrieve more candidates first
+# Number of candidates requested from Chroma
 RETRIEVAL_CANDIDATES = 30
 
-# Only the BEST result is used to decide
-# whether the question belongs to the knowledge base
+# Number of final chunks sent to LLM
+TOP_K = 5
+
+# Compatibility name used by app.py
+RELEVANCE_TOP_K = TOP_K
+
+# Refuse if closest result is too far
 DISTANCE_REFUSAL_THRESHOLD = 0.75
 
 
 # ============================================================
-# CHROMA CLOUD CONFIGURATION
-# ============================================================
-
-CHROMA_API_KEY = os.getenv("CHROMA_API_KEY")
-CHROMA_TENANT = os.getenv("CHROMA_TENANT")
-CHROMA_DATABASE = os.getenv("CHROMA_DATABASE")
-
-
-if not CHROMA_API_KEY:
-    raise ValueError(
-        "CHROMA_API_KEY is not set in .env"
-    )
-
-if not CHROMA_TENANT:
-    raise ValueError(
-        "CHROMA_TENANT is not set in .env"
-    )
-
-if not CHROMA_DATABASE:
-    raise ValueError(
-        "CHROMA_DATABASE is not set in .env"
-    )
-
-
-# ============================================================
-# LOAD EMBEDDING MODEL
+# 2. LOAD EMBEDDING MODEL
 # ============================================================
 
 print("Loading embedding model...")
 
 embedding_model = SentenceTransformer(
-    "all-MiniLM-L6-v2"
+    EMBEDDING_MODEL_NAME
 )
 
 print("Embedding model loaded.")
 
 
 # ============================================================
-# CONNECT TO CHROMA CLOUD
+# 3. CONNECT TO CHROMA CLOUD
 # ============================================================
 
 print("Connecting to Chroma Cloud...")
 
-client_db = chromadb.CloudClient(
+if (
+    not CHROMA_API_KEY
+    or CHROMA_API_KEY == "YOUR_CHROMA_API_KEY"
+):
+    raise RuntimeError(
+        "CHROMA_API_KEY is missing. "
+        "Put your Chroma API key in the CHROMA_API_KEY variable "
+        "at the top of rag.py."
+    )
+
+
+chroma_client = chromadb.CloudClient(
+    api_key=CHROMA_API_KEY,
     tenant=CHROMA_TENANT,
-    database=CHROMA_DATABASE,
-    api_key=CHROMA_API_KEY
+    database=CHROMA_DATABASE
 )
 
-collection = client_db.get_or_create_collection(
+
+collection = chroma_client.get_collection(
     name=COLLECTION_NAME
 )
 
+
+collection_count = collection.count()
+
+
 print(
-    "Cloud collection:",
-    collection.name,
-    "| items:",
-    collection.count()
+    f"Cloud collection: {COLLECTION_NAME} | "
+    f"items: {collection_count}"
 )
 
 
 # ============================================================
-# GROUNDED SYSTEM PROMPT
+# 4. CONSTANTS / FILTERING
 # ============================================================
 
-GROUNDED_SYSTEM_PROMPT = """
-You are HealthInsight AI.
-
-You are a citation-bound healthcare knowledge assistant.
-
-Your ONLY knowledge source is the retrieved content inside
-<context>.
-
-The source document is the WHO document:
-"Medication Safety in Polypharmacy".
-
-STRICT RULES:
-
-1. Answer ONLY using facts explicitly supported by <context>.
-
-2. NEVER use your general medical knowledge.
-
-3. NEVER complete missing information using assumptions.
-
-4. NEVER invent facts.
-
-5. NEVER invent numbers.
-
-6. NEVER invent medical advice.
-
-7. NEVER invent page numbers.
-
-8. NEVER invent sections.
-
-9. NEVER invent citations.
-
-10. If the context does not directly support the answer,
-you MUST refuse.
-
-11. You may combine information from multiple retrieved
-results ONLY when the information is actually supported
-by those results.
-
-12. The retrieved results are ranked by semantic similarity.
-Smaller distance means a closer match.
-
-13. The answer must be based on the retrieved passages,
-not on the question alone.
-
-IMPORTANT:
-
-A result can be semantically related but still not contain
-enough information to answer the question.
-
-If the retrieved passages do not contain enough information,
-return:
-
-confidence = "insufficient"
-citations = []
-evidence = ""
-
-recommendation = a clear refusal
-
-Do NOT answer from outside knowledge.
-
-RETURN ONLY THIS JSON:
-
-{
-  "recommendation": "direct answer or refusal",
-  "evidence": "supporting evidence directly from the retrieved context",
-  "citations": [
-    {
-      "document": "string",
-      "section": "string",
-      "page": number
-    }
-  ],
-  "confidence": "high | medium | low | insufficient"
+EXCLUDED_SECTIONS = {
+    "references",
+    "reference",
+    "bibliography",
+    "front matter",
+    "contents",
+    "table of contents",
+    "acknowledgements"
 }
 
-For insufficient context:
 
-{
-  "recommendation": "I couldn't find enough information in the indexed WHO guideline to answer this confidently. ...",
-  "evidence": "",
-  "citations": [],
-  "confidence": "insufficient"
-}
+def normalize_text(text):
+    """
+    Normalize text to make filtering more reliable.
+    """
 
-Return ONLY valid JSON.
-"""
+    if not text:
+        return ""
+
+    text = str(text)
+
+    text = text.replace("\x00", " ")
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
+
+    return text.strip()
 
 
-# ============================================================
-# REFERENCE FILTER
-# ============================================================
+def normalize_section(section):
+    """
+    Normalize section metadata.
+    """
 
-def is_reference_heavy(text):
+    if not section:
+        return ""
+
+    return normalize_text(section)
+
+
+def is_reference_heavy(text, section=""):
+    """
+    Detect chunks that are mainly references,
+    citations, bibliography entries,
+    or very weak fragments.
+    """
+
+    text = normalize_text(text)
+
+    section = normalize_section(section)
 
     if not text:
         return True
 
-    text_lower = text.lower()
+    section_lower = section.lower().strip()
 
-    reference_words = [
-        "bibliography",
-        "isbn",
-        "doi:",
-        "http://",
-        "https://"
-    ]
+    # Explicit excluded sections
+    if section_lower in EXCLUDED_SECTIONS:
+        return True
 
-    score = 0
+    # Reference-like section names
+    if "reference" in section_lower:
+        return True
 
-    for word in reference_words:
+    if "bibliograph" in section_lower:
+        return True
 
-        if word in text_lower:
-            score += 1
+    # Very short chunks
+    if len(text) < 80:
+        return True
 
-    if len(text.strip()) < 30:
-        score += 1
+    # Mostly citation-like text
+    citation_matches = re.findall(
+        r"\(\s*\d+(?:[-–]\d+)?\s*\)",
+        text
+    )
 
-    return score >= 2
+    if len(citation_matches) >= 5 and len(text) < 500:
+        return True
+
+    # Too many URLs / DOI-like strings
+    url_count = len(
+        re.findall(
+            r"(https?://|doi\.org|www\.)",
+            text.lower()
+        )
+    )
+
+    if url_count >= 2:
+        return True
+
+    return False
 
 
 # ============================================================
-# RETRIEVAL
+# 5. METADATA HELPERS
 # ============================================================
 
-def retrieve(
-    query,
-    top_k=RELEVANCE_TOP_K
+def get_metadata_value(
+    metadata,
+    *keys,
+    default=""
 ):
+    """
+    Safely get metadata from Chroma.
+    """
+
+    if not metadata:
+        return default
+
+    for key in keys:
+
+        value = metadata.get(key)
+
+        if (
+            value is not None
+            and str(value).strip()
+        ):
+            return value
+
+    return default
+
+
+def get_page(metadata):
+    """
+    Get page number safely.
+    """
+
+    value = get_metadata_value(
+        metadata,
+        "page",
+        "page_number",
+        "page_num",
+        default=""
+    )
+
+    try:
+        return int(value)
+
+    except (TypeError, ValueError):
+        return value
+
+
+def get_section(metadata):
+    """
+    Get section safely.
+    """
+
+    section = get_metadata_value(
+        metadata,
+        "section",
+        "section_name",
+        "heading",
+        default=""
+    )
+
+    return normalize_section(section)
+
+
+def get_document(metadata):
+    """
+    Get document name safely.
+    """
+
+    return get_metadata_value(
+        metadata,
+        "document",
+        "document_name",
+        default="WHO Medication Safety in Polypharmacy"
+    )
+
+
+def get_source(metadata):
+    """
+    Get source file safely.
+    """
+
+    return get_metadata_value(
+        metadata,
+        "source_pdf",
+        "source",
+        "file_name",
+        default="WHO-UHC-SDS-2019.11-eng.pdf"
+    )
+
+
+# ============================================================
+# 6. RETRIEVAL
+# ============================================================
+
+def retrieve_documents(
+    query,
+    top_k=TOP_K
+):
+    """
+    Retrieve relevant chunks from Chroma Cloud.
+
+    - Request many candidates.
+    - Filter weak/reference chunks.
+    - Sort by distance ascending.
+    - Lower distance = more relevant.
+    """
+
+    print("\nRetrieving documents...")
 
     query_embedding = embedding_model.encode(
         query,
         normalize_embeddings=True
-    )
+    ).tolist()
 
-    candidate_count = max(
-        RETRIEVAL_CANDIDATES,
-        top_k
-    )
 
-    results = collection.query(
-        query_embeddings=[
-            query_embedding.tolist()
-        ],
-        n_results=candidate_count,
+    raw_results = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=RETRIEVAL_CANDIDATES,
         include=[
             "documents",
             "metadatas",
@@ -253,962 +317,761 @@ def retrieve(
         ]
     )
 
-    retrieved = []
 
-    if not results.get("ids"):
-        return retrieved
+    documents = raw_results.get(
+        "documents",
+        [[]]
+    )[0]
 
-    if not results["ids"][0]:
-        return retrieved
+    metadatas = raw_results.get(
+        "metadatas",
+        [[]]
+    )[0]
 
-    for i in range(
-        len(results["ids"][0])
-    ):
+    distances = raw_results.get(
+        "distances",
+        [[]]
+    )[0]
 
-        text = (
-            results["documents"][0][i]
-            if results["documents"][0]
-            else ""
+
+    candidates = []
+
+
+    for i in range(len(documents)):
+
+        text = normalize_text(
+            documents[i]
         )
 
         metadata = (
-            results["metadatas"][0][i]
-            or {}
+            metadatas[i]
+            if i < len(metadatas)
+            else {}
         )
 
         distance = (
-            results["distances"][0][i]
-            if results.get("distances")
-            and results["distances"][0]
-            else 1.0
+            distances[i]
+            if i < len(distances)
+            else 999.0
         )
 
-        section = metadata.get(
-            "section",
-            ""
+
+        section = get_section(
+            metadata
         )
 
+
         # ----------------------------------------------------
-        # Ignore bibliography/reference chunks
+        # Filter weak/reference chunks
         # ----------------------------------------------------
 
-        if is_reference_heavy(text):
+        if is_reference_heavy(
+            text,
+            section
+        ):
 
             print(
-                "Filtered reference-heavy chunk"
+                "Filtered weak/reference chunk"
             )
 
             continue
 
-        if section:
-
-            section_lower = section.lower()
-
-            if (
-                "reference" in section_lower
-                or "bibliography" in section_lower
-            ):
-
-                print(
-                    "Filtered section:",
-                    section
-                )
-
-                continue
-
-        retrieved.append({
-
-            "chunk_id":
-                results["ids"][0][i],
-
-            "text":
-                text,
-
-            "distance":
-                float(distance),
-
-            "document":
-                metadata.get(
-                    "document",
-                    "WHO Medication Safety in Polypharmacy"
-                ),
-
-            "section":
-                section,
-
-            "page_number":
-                metadata.get(
-                    "page_number"
-                ),
-
-            "source":
-                metadata.get(
-                    "source",
-                    "WHO-UHC-SDS-2019.11-eng.pdf"
-                ),
-
-            "source_pdf":
-                metadata.get(
-                    "source_pdf",
-                    "WHO-UHC-SDS-2019.11-eng.pdf"
-                )
-        })
-
-    # --------------------------------------------------------
-    # Smaller distance = closer result
-    # --------------------------------------------------------
-
-    retrieved.sort(
-        key=lambda x: x["distance"]
-    )
-
-    return retrieved[:top_k]
-
-
-# ============================================================
-# TOP DISTANCE
-# ============================================================
-
-def top_distance(retrieved):
-
-    if not retrieved:
-        return 1.0
-
-    return min(
-        item["distance"]
-        for item in retrieved
-    )
-
-
-# ============================================================
-# REFUSAL MESSAGE
-# ============================================================
-
-def build_refusal_message(query):
-
-    return (
-        "I couldn't find enough information in the indexed "
-        "WHO guideline to answer this confidently. "
-        f'I searched the retrieved passages for "{query}". '
-        "Try rephrasing the question or ask about a topic "
-        "covered by the WHO Medication Safety knowledge base."
-    )
-
-
-# ============================================================
-# BUILD CONTEXT
-# ============================================================
-
-def assemble_prompt(
-    query,
-    retrieved_chunks
-):
-
-    context_blocks = []
-
-    for index, item in enumerate(
-        retrieved_chunks,
-        start=1
-    ):
-
-        page = item.get(
-            "page_number"
-        )
-
-        if page is None:
-            page = "Not specified"
-
-        section = item.get(
-            "section"
-        )
-
-        if not section:
-            section = "Not specified"
-
-        context_blocks.append(
-
-            f"""
-RESULT #{index}
-
-Document:
-{item["document"]}
-
-Section:
-{section}
-
-Page:
-{page}
-
-Distance:
-{item["distance"]}
-
-Content:
-{item["text"]}
-"""
-        )
-
-    context = (
-        "\n\n==============================\n\n"
-        .join(context_blocks)
-    )
-
-    return f"""
-<context>
-
-{context}
-
-</context>
-
-QUESTION:
-{query}
-
-IMPORTANT:
-
-Answer ONLY from the information explicitly contained
-inside <context>.
-
-If the context does not directly contain enough information
-to answer the question, refuse.
-
-Do not use outside medical knowledge.
-
-Return ONLY valid JSON.
-"""
-
-
-# ============================================================
-# CALL OLLAMA
-# ============================================================
-
-def call_ollama(
-    system_prompt,
-    user_message
-):
-
-    payload = {
-
-        "model":
-            OLLAMA_MODEL,
-
-        "messages": [
-
-            {
-                "role":
-                    "system",
-
-                "content":
-                    system_prompt
-            },
-
-            {
-                "role":
-                    "user",
-
-                "content":
-                    user_message
-            }
-
-        ],
-
-        "stream":
-            False,
-
-        "options": {
-
-            "temperature":
-                0
-        }
-    }
-
-    data = json.dumps(
-        payload
-    ).encode("utf-8")
-
-    request = urllib.request.Request(
-
-        OLLAMA_URL,
-
-        data=data,
-
-        headers={
-            "Content-Type":
-                "application/json"
-        },
-
-        method="POST"
-    )
-
-    try:
-
-        with urllib.request.urlopen(
-            request,
-            timeout=120
-        ) as response:
-
-            response_data = (
-                response
-                .read()
-                .decode("utf-8")
-            )
-
-            result = json.loads(
-                response_data
-            )
-
-            return (
-                result
-                .get("message", {})
-                .get("content", "")
-            )
-
-    except urllib.error.HTTPError as e:
-
-        error_body = (
-            e.read()
-            .decode(
-                "utf-8",
-                errors="ignore"
-            )
-        )
-
-        raise RuntimeError(
-            f"Ollama HTTP error {e.code}: "
-            f"{error_body}"
-        )
-
-    except urllib.error.URLError as e:
-
-        raise RuntimeError(
-            "Could not connect to Ollama. "
-            "Make sure Ollama is running. "
-            f"Details: {e}"
-        )
-
-    except Exception as e:
-
-        raise RuntimeError(
-            f"Ollama error: {str(e)}"
-        )
-
-
-# ============================================================
-# PARSE JSON
-# ============================================================
-
-def parse_llm_json(raw_text):
-
-    if not raw_text:
-
-        return (
-            None,
-            "Empty model response"
-        )
-
-    cleaned = raw_text.strip()
-
-    # Remove markdown code fences
-    if cleaned.startswith("```"):
-
-        lines = cleaned.splitlines()
-
-        if lines:
-            lines = lines[1:]
 
         if (
-            lines
-            and lines[-1].strip() == "```"
+            section.lower()
+            in EXCLUDED_SECTIONS
         ):
 
-            lines = lines[:-1]
-
-        cleaned = "\n".join(
-            lines
-        ).strip()
-
-    # Find JSON object
-    if not cleaned.startswith("{"):
-
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-
-        if (
-            start != -1
-            and end != -1
-        ):
-
-            cleaned = cleaned[
-                start:end + 1
-            ]
-
-    try:
-
-        return (
-            json.loads(cleaned),
-            None
-        )
-
-    except json.JSONDecodeError as e:
-
-        return (
-            None,
-            str(e)
-        )
-
-
-# ============================================================
-# VALIDATE RESPONSE
-# ============================================================
-
-def validate_response(obj):
-
-    if not isinstance(
-        obj,
-        dict
-    ):
-
-        return False
-
-    required = [
-        "recommendation",
-        "evidence",
-        "citations",
-        "confidence"
-    ]
-
-    for key in required:
-
-        if key not in obj:
-            return False
-
-    allowed_confidence = [
-        "high",
-        "medium",
-        "low",
-        "insufficient"
-    ]
-
-    if (
-        obj["confidence"]
-        not in allowed_confidence
-    ):
-
-        return False
-
-    if not isinstance(
-        obj["recommendation"],
-        str
-    ):
-
-        return False
-
-    if not isinstance(
-        obj["evidence"],
-        str
-    ):
-
-        return False
-
-    if not isinstance(
-        obj["citations"],
-        list
-    ):
-
-        return False
-
-    # --------------------------------------------------------
-    # Insufficient MUST have no evidence/citations
-    # --------------------------------------------------------
-
-    if obj["confidence"] == "insufficient":
-
-        if obj["evidence"].strip():
-            return False
-
-        if obj["citations"]:
-            return False
-
-    # --------------------------------------------------------
-    # High / Medium must have evidence + citations
-    # --------------------------------------------------------
-
-    if obj["confidence"] in [
-        "high",
-        "medium"
-    ]:
-
-        if not obj["evidence"].strip():
-            return False
-
-        if not obj["citations"]:
-            return False
-
-    # --------------------------------------------------------
-    # Validate citations
-    # --------------------------------------------------------
-
-    for citation in obj["citations"]:
-
-        if not isinstance(
-            citation,
-            dict
-        ):
-
-            return False
-
-        if "document" not in citation:
-            return False
-
-        if "section" not in citation:
-            return False
-
-        if "page" not in citation:
-            return False
-
-    return True
-
-
-# ============================================================
-# BUILD FRONTEND RESULTS
-# ============================================================
-
-def build_results(
-    retrieved
-):
-
-    results = []
-
-    for item in retrieved:
-
-        page = item.get(
-            "page_number"
-        )
-
-        if page is None:
-            page = "Not specified"
-
-        section = item.get(
-            "section"
-        )
-
-        if not section:
-            section = "Not specified"
-
-        source = item.get(
-            "source"
-        )
-
-        if not source:
-            source = (
-                item.get(
-                    "source_pdf"
-                )
-                or
-                "WHO-UHC-SDS-2019.11-eng.pdf"
+            print(
+                f"Filtered section: {section}"
             )
 
-        # ----------------------------------------------------
-        # Smaller distance = higher similarity
-        # ----------------------------------------------------
+            continue
 
-        distance = float(
-            item["distance"]
-        )
+
+        # ----------------------------------------------------
+        # Similarity
+        # ----------------------------------------------------
 
         similarity = max(
             0.0,
-            1.0 - distance
+            min(
+                1.0,
+                1.0 - float(distance)
+            )
         )
 
-        results.append({
 
-            "rank": 0,
+        # ----------------------------------------------------
+        # Metadata
+        # ----------------------------------------------------
 
-            "answer":
-                item["text"],
+        chunk_id = get_metadata_value(
+            metadata,
+            "chunk_id",
+            "id",
+            default=""
+        )
 
-            "text":
-                item["text"],
 
-            "chunk_id":
-                item["chunk_id"],
+        page = get_page(
+            metadata
+        )
 
-            "distance":
-                distance,
 
-            "similarity":
-                similarity,
+        document = get_document(
+            metadata
+        )
 
-            "similarity_percent":
-                round(
-                    similarity * 100,
-                    2
-                ),
 
-            "document":
-                item["document"],
+        source = get_source(
+            metadata
+        )
 
-            "page":
-                page,
 
-            "page_number":
-                page,
+        candidates.append({
 
-            "section":
-                section,
+            "text": text,
 
-            "source":
-                source,
+            "chunk_id": chunk_id,
 
-            "source_pdf":
-                source
+            "distance": float(
+                distance
+            ),
+
+            "similarity": similarity,
+
+            "similarity_percent": round(
+                similarity * 100,
+                2
+            ),
+
+            "document": document,
+
+            "page": page,
+
+            "page_number": page,
+
+            "section": section,
+
+            "source": source,
+
+            "source_pdf": source
         })
 
-    # --------------------------------------------------------
-    # Highest similarity first
-    # --------------------------------------------------------
 
-    results.sort(
-        key=lambda x: x["similarity"],
-        reverse=True
+    # ========================================================
+    # Sort CLOSEST -> FARTHEST
+    # ========================================================
+
+    candidates.sort(
+        key=lambda x: x["distance"]
     )
 
-    # --------------------------------------------------------
-    # Re-number ranks
-    # --------------------------------------------------------
 
-    for index, result in enumerate(
+    results = candidates[:top_k]
+
+
+    # ========================================================
+    # Assign ranks
+    # ========================================================
+
+    for rank, result in enumerate(
         results,
         start=1
     ):
 
-        result["rank"] = index
+        result["rank"] = rank
+
+
+    print(
+        "\nFinal filtered retrieval:"
+    )
+
+
+    for result in results:
+
+        print(
+            f"#{result['rank']} | "
+            f"page={result['page']} | "
+            f"section={result['section']} | "
+            f"distance={result['distance']:.4f} | "
+            f"text_length={len(result['text'])}"
+        )
+
+
+    print(
+        f"\nRetrieved relevant results: "
+        f"{len(results)}"
+    )
+
+
+    for result in results:
+
+        print(
+            f"#{result['rank']} | "
+            f"distance={result['distance']:.4f} | "
+            f"similarity={result['similarity']:.4f} | "
+            f"similarity%={result['similarity_percent']:.2f}% | "
+            f"page={result['page']} | "
+            f"section={result['section']}"
+        )
+
 
     return results
 
 
 # ============================================================
-# MAIN RAG PIPELINE
+# 7. BUILD CONTEXT
 # ============================================================
 
-def run_pipeline(query):
+def build_context(results):
 
-    query = query.strip()
+    """
+    Build numbered context for Ollama.
+    """
 
-    # --------------------------------------------------------
-    # 1. RETRIEVE TOP 5 FROM CHROMA CLOUD
-    # --------------------------------------------------------
+    context_parts = []
 
-    retrieved = retrieve(
-        query,
-        top_k=RELEVANCE_TOP_K
+
+    for result in results:
+
+        context_parts.append(
+
+            f"""
+SOURCE {result['rank']}
+
+Document: {result['document']}
+
+Page: {result['page']}
+
+Section: {result['section']}
+
+Source file: {result['source']}
+
+Text:
+
+{result['text']}
+""".strip()
+        )
+
+
+    return (
+        "\n\n"
+        "=============================="
+        "\n\n"
+    ).join(
+        context_parts
     )
 
-    # --------------------------------------------------------
-    # 2. NO RESULTS
-    # --------------------------------------------------------
 
-    if not retrieved:
+# ============================================================
+# 8. FIND BEST SOURCE
+# ============================================================
 
-        return {
+def find_best_source(results):
 
-            "query":
-                query,
+    """
+    Always select strongest retrieved chunk.
+    """
 
-            "recommendation":
-                build_refusal_message(
-                    query
-                ),
+    if not results:
+        return None
 
-            "evidence":
-                "",
+    return results[0]
 
-            "citations":
-                [],
 
-            "confidence":
-                "insufficient",
+# ============================================================
+# 9. VALIDATE CITATION
+# ============================================================
 
-            "refused":
-                True,
+def validate_citation(
+    citation,
+    results
+):
 
-            "refusal_reason":
-                "no_relevant_results",
+    """
+    Make sure citation comes from
+    an actual retrieved result.
+    """
 
-            "results":
-                [],
+    if not citation:
+        return False
 
-            "top_distance":
-                1.0
+
+    document = citation.get(
+        "document",
+        ""
+    )
+
+    section = citation.get(
+        "section",
+        ""
+    )
+
+    page = citation.get(
+        "page",
+        ""
+    )
+
+
+    for result in results:
+
+        if (
+            str(result["document"]).strip()
+            == str(document).strip()
+
+            and
+
+            str(result["section"]).strip()
+            == str(section).strip()
+
+            and
+
+            str(result["page"]).strip()
+            == str(page).strip()
+        ):
+
+            return True
+
+
+    return False
+
+
+# ============================================================
+# 10. CALL OLLAMA
+# ============================================================
+
+def call_ollama(
+    query,
+    results
+):
+
+    context = build_context(
+        results
+    )
+
+
+    system_prompt = """
+
+You are HealthInsight, a citation-grounded medical information assistant.
+
+Your task is to answer ONLY from the supplied WHO document context.
+
+Rules:
+
+1. Do NOT use outside knowledge.
+
+2. Do NOT invent facts.
+
+3. Do NOT invent pages.
+
+4. Do NOT invent sections.
+
+5. Do NOT create citations yourself.
+
+6. The final citation will be selected by the application from the retrieved chunks.
+
+7. Keep the answer concise and directly related to the question.
+
+8. The evidence must be directly supported by the supplied context.
+
+9. If the context does not contain enough information, say that the available WHO context is insufficient.
+
+10. Return valid JSON only.
+
+Return exactly:
+
+{
+  "recommendation": "answer based only on context",
+  "evidence": "direct supporting statement based only on context",
+  "confidence": "high"
+}
+
+"""
+
+
+    user_prompt = f"""
+
+Question:
+
+{query}
+
+WHO DOCUMENT CONTEXT:
+
+{context}
+
+Answer the question using only this context.
+
+"""
+
+
+    payload = {
+
+        "model": OLLAMA_MODEL,
+
+        "messages": [
+
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+
+            {
+                "role": "user",
+                "content": user_prompt
+            }
+
+        ],
+
+        "stream": False,
+
+        "format": "json",
+
+        "options": {
+            "temperature": 0.0
         }
+    }
 
-    # --------------------------------------------------------
-    # 3. BEST MATCH
-    # --------------------------------------------------------
 
-    distance = top_distance(
-        retrieved
+    response = requests.post(
+
+        OLLAMA_URL,
+
+        json=payload,
+
+        timeout=120
+    )
+
+
+    response.raise_for_status()
+
+
+    data = response.json()
+
+
+    raw_content = data.get(
+        "message",
+        {}
+    ).get(
+        "content",
+        ""
+    )
+
+
+    print(
+        "\nRaw Ollama response:"
     )
 
     print(
-        "\nRetrieved relevant results:",
-        len(retrieved)
+        raw_content
     )
 
-    for index, item in enumerate(
-        retrieved,
-        start=1
-    ):
-
-        similarity = max(
-            0.0,
-            1.0 - item["distance"]
-        )
-
-        print(
-            f"#{index} | "
-            f"distance={item['distance']:.4f} | "
-            f"similarity={similarity:.4f} | "
-            f"similarity%={similarity * 100:.2f}% | "
-            f"page={item.get('page_number')} | "
-            f"section={item.get('section')}"
-        )
-
-    # --------------------------------------------------------
-    # 4. KNOWLEDGE BASE GATE
-    # --------------------------------------------------------
-
-    if (
-        distance
-        > DISTANCE_REFUSAL_THRESHOLD
-    ):
-
-        print(
-            "Question rejected by distance gate:",
-            distance
-        )
-
-        return {
-
-            "query":
-                query,
-
-            "recommendation":
-                build_refusal_message(
-                    query
-                ),
-
-            "evidence":
-                "",
-
-            "citations":
-                [],
-
-            "confidence":
-                "insufficient",
-
-            "refused":
-                True,
-
-            "refusal_reason":
-                "no_relevant_results",
-
-            "results":
-                [],
-
-            "top_distance":
-                distance
-        }
-
-    # --------------------------------------------------------
-    # 5. BUILD CONTEXT
-    # --------------------------------------------------------
-
-    user_message = assemble_prompt(
-        query,
-        retrieved
-    )
-
-    # --------------------------------------------------------
-    # 6. OLLAMA
-    # --------------------------------------------------------
 
     try:
 
-        raw = call_ollama(
-            GROUNDED_SYSTEM_PROMPT,
-            user_message
+        parsed = json.loads(
+            raw_content
         )
 
-    except Exception as e:
+    except json.JSONDecodeError:
 
-        print(
-            "Ollama error:",
-            str(e)
-        )
-
-        return {
-
-            "query":
-                query,
+        parsed = {
 
             "recommendation":
-                "The local AI service could not be reached.",
+                raw_content.strip(),
 
             "evidence":
                 "",
 
-            "citations":
-                [],
-
             "confidence":
-                "insufficient",
-
-            "refused":
-                True,
-
-            "refusal_reason":
-                f"llm_error: {str(e)}",
-
-            "results":
-                build_results(
-                    retrieved
-                ),
-
-            "top_distance":
-                distance
+                "medium"
         }
 
-    # --------------------------------------------------------
-    # 7. PARSE
-    # --------------------------------------------------------
-
-    parsed, parse_error = (
-        parse_llm_json(raw)
-    )
-
-    if parsed is None:
-
-        print(
-            "JSON parse failed:",
-            parse_error
-        )
-
-        return {
-
-            "query":
-                query,
-
-            "recommendation":
-                build_refusal_message(
-                    query
-                ),
-
-            "evidence":
-                "",
-
-            "citations":
-                [],
-
-            "confidence":
-                "insufficient",
-
-            "refused":
-                True,
-
-            "refusal_reason":
-                "json_parse_failed",
-
-            "results":
-                build_results(
-                    retrieved
-                ),
-
-            "top_distance":
-                distance
-        }
-
-    # --------------------------------------------------------
-    # 8. VALIDATE
-    # --------------------------------------------------------
-
-    if not validate_response(
-        parsed
-    ):
-
-        print(
-            "Response validation failed"
-        )
-
-        return {
-
-            "query":
-                query,
-
-            "recommendation":
-                build_refusal_message(
-                    query
-                ),
-
-            "evidence":
-                "",
-
-            "citations":
-                [],
-
-            "confidence":
-                "insufficient",
-
-            "refused":
-                True,
-
-            "refusal_reason":
-                "response_validation_failed",
-
-            "results":
-                build_results(
-                    retrieved
-                ),
-
-            "top_distance":
-                distance
-        }
-
-    # --------------------------------------------------------
-    # 9. FINAL RESPONSE
-    # --------------------------------------------------------
-
-    parsed["query"] = query
-
-    parsed["refused"] = (
-        parsed["confidence"]
-        == "insufficient"
-    )
-
-    parsed["top_distance"] = distance
-
-    # Valid question:
-    # ALWAYS return TOP 5 source chunks.
-    #
-    # Invalid/outside question:
-    # return 0 results.
-
-    if parsed["refused"]:
-
-        parsed["results"] = []
-
-    else:
-
-        parsed["results"] = (
-            build_results(
-                retrieved
-            )
-        )
 
     return parsed
 
 
 # ============================================================
-# TEST
+# 11. MAIN RAG FUNCTION
+# ============================================================
+
+def ask_healthinsight(query):
+
+    query = normalize_text(
+        query
+    )
+
+
+    if not query:
+
+        return {
+
+            "recommendation":
+                "",
+
+            "evidence":
+                "",
+
+            "citations":
+                [],
+
+            "confidence":
+                "low",
+
+            "query":
+                query,
+
+            "refused":
+                True,
+
+            "reason":
+                "Empty query",
+
+            "results":
+                []
+        }
+
+
+    # --------------------------------------------------------
+    # Retrieval
+    # --------------------------------------------------------
+
+    results = retrieve_documents(
+        query,
+        top_k=TOP_K
+    )
+
+
+    if not results:
+
+        return {
+
+            "recommendation":
+                "I could not find sufficient information "
+                "in the WHO document to answer this question.",
+
+            "evidence":
+                "",
+
+            "citations":
+                [],
+
+            "confidence":
+                "low",
+
+            "query":
+                query,
+
+            "refused":
+                True,
+
+            "reason":
+                "No relevant retrieved chunks",
+
+            "results":
+                []
+        }
+
+
+    # --------------------------------------------------------
+    # Distance refusal
+    # --------------------------------------------------------
+
+    top_distance = results[0]["distance"]
+
+
+    if (
+        top_distance
+        > DISTANCE_REFUSAL_THRESHOLD
+    ):
+
+        return {
+
+            "recommendation":
+                "I could not find sufficiently relevant "
+                "information in the WHO document to answer "
+                "this question.",
+
+            "evidence":
+                "",
+
+            "citations":
+                [],
+
+            "confidence":
+                "low",
+
+            "query":
+                query,
+
+            "refused":
+                True,
+
+            "reason":
+                "Retrieval relevance too low",
+
+            "top_distance":
+                top_distance,
+
+            "results":
+                results
+        }
+
+
+    # --------------------------------------------------------
+    # Ask LLM
+    # --------------------------------------------------------
+
+    llm_result = call_ollama(
+        query,
+        results
+    )
+
+
+    # --------------------------------------------------------
+    # Citation selected by application
+    # --------------------------------------------------------
+
+    best_source = find_best_source(
+        results
+    )
+
+
+    citation = {
+
+        "document":
+            best_source["document"],
+
+        "section":
+            best_source["section"],
+
+        "page":
+            best_source["page"]
+    }
+
+
+    # --------------------------------------------------------
+    # Validate citation
+    # --------------------------------------------------------
+
+    if not validate_citation(
+        citation,
+        results
+    ):
+
+        print(
+            "Citation validation failed. "
+            "Using top retrieved result."
+        )
+
+
+        best_source = results[0]
+
+
+        citation = {
+
+            "document":
+                best_source["document"],
+
+            "section":
+                best_source["section"],
+
+            "page":
+                best_source["page"]
+        }
+
+
+    # --------------------------------------------------------
+    # Final response
+    # --------------------------------------------------------
+
+    final_result = {
+
+        "recommendation":
+            normalize_text(
+                llm_result.get(
+                    "recommendation",
+                    ""
+                )
+            ),
+
+        "evidence":
+            normalize_text(
+                llm_result.get(
+                    "evidence",
+                    ""
+                )
+            ),
+
+        "citations":
+            [
+                citation
+            ],
+
+        "confidence":
+            llm_result.get(
+                "confidence",
+                "medium"
+            ),
+
+        "query":
+            query,
+
+        "refused":
+            False,
+
+        "top_distance":
+            top_distance,
+
+        "results":
+            results
+    }
+
+
+    print(
+        "\nFINAL RESULT:"
+    )
+
+
+    print(
+        json.dumps(
+            final_result,
+            indent=2,
+            ensure_ascii=False
+        )
+    )
+
+
+    return final_result
+
+
+# # ============================================================
+# 12. BACKWARD-COMPATIBILITY ALIASES
+# ============================================================
+
+def query_rag(query):
+    """
+    Compatibility alias.
+    """
+    return ask_healthinsight(query)
+
+
+def rag_chat(query):
+    """
+    Compatibility alias.
+    """
+    return ask_healthinsight(query)
+
+
+def run_pipeline(query):
+    """
+    Main pipeline used by Flask app.
+    """
+    return ask_healthinsight(query)
+
+# ============================================================
+# 13. TEST
 # ============================================================
 
 if __name__ == "__main__":
@@ -1225,35 +1088,44 @@ if __name__ == "__main__":
         "==============================\n"
     )
 
-    print(
-        "Chroma Cloud database:",
-        CHROMA_DATABASE
-    )
 
     print(
-        "Collection:",
-        collection.name
+        f"Chroma Cloud database: "
+        f"{CHROMA_DATABASE}"
+    )
+
+
+    print(
+        f"Collection: "
+        f"{COLLECTION_NAME}"
+    )
+
+
+    print(
+        f"Collection items: "
+        f"{collection_count}"
+    )
+
+
+    test_query = (
+        "What medication-related risks or problems "
+        "are associated with polypharmacy?"
+    )
+
+
+    result = ask_healthinsight(
+        test_query
+    )
+
+
+    print(
+        "\n=============================="
     )
 
     print(
-        "Collection items:",
-        collection.count()
-    )
-
-    test_question = (
-        "What medication-related risks "
-        "or problems are associated "
-        "with polypharmacy?"
-    )
-
-    result = run_pipeline(
-        test_question
+        "TEST FINISHED"
     )
 
     print(
-        json.dumps(
-            result,
-            indent=2,
-            ensure_ascii=False
-        )
+        "=============================="
     )

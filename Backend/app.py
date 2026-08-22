@@ -16,7 +16,7 @@ from rag import (
 
 app = Flask(__name__)
 
-# Allow frontend requests
+# Allow requests from local React frontend
 CORS(app)
 
 
@@ -39,7 +39,7 @@ def home():
             "HealthInsight RAG",
 
         "database":
-            "ChromaDB",
+            "ChromaDB Cloud",
 
         "collection":
             collection.name,
@@ -71,10 +71,7 @@ def home():
 # HEALTH CHECK
 # =========================================================
 
-@app.route(
-    "/api/health",
-    methods=["GET"]
-)
+@app.route("/api/health", methods=["GET"])
 def health():
 
     try:
@@ -135,10 +132,7 @@ def health():
 # CHAT
 # =========================================================
 
-@app.route(
-    "/api/chat",
-    methods=["POST"]
-)
+@app.route("/api/chat", methods=["POST"])
 def chat():
 
     try:
@@ -147,9 +141,7 @@ def chat():
         # GET JSON
         # -------------------------------------------------
 
-        data = request.get_json(
-            silent=True
-        )
+        data = request.get_json(silent=True)
 
         if not data:
 
@@ -162,17 +154,29 @@ def chat():
 
         # -------------------------------------------------
         # GET QUESTION
+        #
+        # Accept both:
+        # {
+        #   "question": "..."
+        # }
+        #
+        # and:
+        #
+        # {
+        #   "message": "..."
+        # }
         # -------------------------------------------------
 
-        question = data.get(
-            "question",
-            ""
-        )
+        question = data.get("question")
 
-        if not isinstance(
-            question,
-            str
-        ):
+        if question is None:
+            question = data.get("message", "")
+
+        # -------------------------------------------------
+        # VALIDATE QUESTION
+        # -------------------------------------------------
+
+        if not isinstance(question, str):
 
             return jsonify({
 
@@ -196,71 +200,40 @@ def chat():
         # LOG QUESTION
         # -------------------------------------------------
 
-        print(
-            "\n===================================="
-        )
-
-        print(
-            "HealthInsight RAG - New Question"
-        )
-
-        print(
-            "===================================="
-        )
-
-        print(
-            "Question:",
-            question
-        )
+        print("\n====================================")
+        print("HealthInsight RAG - New Question")
+        print("====================================")
+        print("Question:", question)
 
         # -------------------------------------------------
         # RUN RAG
         # -------------------------------------------------
 
-        result = run_pipeline(
-            question
-        )
+        result = run_pipeline(question)
 
         # -------------------------------------------------
         # LOG RESPONSE
         # -------------------------------------------------
 
-        print(
-            "\nRAG Response"
-        )
-
-        print(
-            "------------------------------------"
-        )
+        print("\nRAG Response")
+        print("------------------------------------")
 
         print(
             "Confidence:",
-            result.get(
-                "confidence",
-                "unknown"
-            )
+            result.get("confidence", "unknown")
         )
 
         print(
             "Refused:",
-            result.get(
-                "refused",
-                False
-            )
+            result.get("refused", False)
         )
 
         print(
             "Top distance:",
-            result.get(
-                "top_distance",
-                "N/A"
-            )
+            result.get("top_distance", "N/A")
         )
 
-        results = result.get(
-            "results",
-            []
-        )
+        results = result.get("results", [])
 
         print(
             "Results:",
@@ -268,7 +241,7 @@ def chat():
         )
 
         # -------------------------------------------------
-        # PRINT RESULTS
+        # PRINT RETRIEVED RESULTS
         # -------------------------------------------------
 
         for index, item in enumerate(
@@ -280,39 +253,22 @@ def chat():
                 f"#{index} | "
                 f"Page: {item.get('page', 'N/A')} | "
                 f"Section: {item.get('section', 'N/A')} | "
-                f"Distance: "
-                f"{item.get('distance', 'N/A')}"
+                f"Distance: {item.get('distance', 'N/A')} | "
+                f"Similarity: {item.get('similarity_percent', 'N/A')}%"
             )
 
         # -------------------------------------------------
-        # RETURN JSON
+        # RETURN RAG RESULT
         # -------------------------------------------------
 
-        return jsonify(
-            result
-        ), 200
+        return jsonify(result), 200
 
     except Exception as e:
 
-        # -------------------------------------------------
-        # SERVER ERROR
-        # -------------------------------------------------
-
-        print(
-            "\n===================================="
-        )
-
-        print(
-            "ERROR"
-        )
-
-        print(
-            "===================================="
-        )
-
-        print(
-            str(e)
-        )
+        print("\n====================================")
+        print("ERROR")
+        print("====================================")
+        print(str(e))
 
         return jsonify({
 
@@ -320,12 +276,8 @@ def chat():
                 "An error occurred while processing the question.",
 
             "details":
-                str(e),
+                str(e)
 
-            "query":
-                request.get_json(
-                    silent=True
-                )
         }), 500
 
 
@@ -342,13 +294,9 @@ def not_found(error):
             "Endpoint not found",
 
         "available_endpoints": [
-
             "/",
-
             "/api/health",
-
             "/api/chat"
-
         ]
 
     }), 404
@@ -371,21 +319,11 @@ def method_not_allowed(error):
 
 if __name__ == "__main__":
 
-    print(
-        "\n===================================="
-    )
+    print("\n====================================")
+    print("       HealthInsight RAG Backend")
+    print("====================================")
 
-    print(
-        "       HealthInsight RAG Backend"
-    )
-
-    print(
-        "===================================="
-    )
-
-    print(
-        f"Database: ChromaDB"
-    )
+    print("Database: ChromaDB Cloud")
 
     print(
         f"Collection: {collection.name}"
@@ -427,27 +365,13 @@ if __name__ == "__main__":
         "http://127.0.0.1:5000/api/health"
     )
 
-    print(
-        "===================================="
-    )
-
-    print(
-        "Server is ready."
-    )
-
-    print(
-        "Press CTRL+C to stop."
-    )
-
-    print(
-        "====================================\n"
-    )
+    print("====================================")
+    print("Server is ready.")
+    print("Press CTRL+C to stop.")
+    print("====================================\n")
 
     app.run(
-
         host="127.0.0.1",
-
         port=5000,
-
         debug=False
     )
