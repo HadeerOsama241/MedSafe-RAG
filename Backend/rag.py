@@ -1,16 +1,23 @@
+import os
 import json
 import urllib.request
 import urllib.error
 
 import chromadb
 from sentence_transformers import SentenceTransformer
+from dotenv import load_dotenv
+
+
+# ============================================================
+# LOAD ENVIRONMENT VARIABLES
+# ============================================================
+
+load_dotenv()
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
-
-CHROMA_PATH = "./chroma_db"
 
 COLLECTION_NAME = "who_medication_safety_day1"
 
@@ -30,6 +37,31 @@ DISTANCE_REFUSAL_THRESHOLD = 0.75
 
 
 # ============================================================
+# CHROMA CLOUD CONFIGURATION
+# ============================================================
+
+CHROMA_API_KEY = os.getenv("CHROMA_API_KEY")
+CHROMA_TENANT = os.getenv("CHROMA_TENANT")
+CHROMA_DATABASE = os.getenv("CHROMA_DATABASE")
+
+
+if not CHROMA_API_KEY:
+    raise ValueError(
+        "CHROMA_API_KEY is not set in .env"
+    )
+
+if not CHROMA_TENANT:
+    raise ValueError(
+        "CHROMA_TENANT is not set in .env"
+    )
+
+if not CHROMA_DATABASE:
+    raise ValueError(
+        "CHROMA_DATABASE is not set in .env"
+    )
+
+
+# ============================================================
 # LOAD EMBEDDING MODEL
 # ============================================================
 
@@ -43,13 +75,15 @@ print("Embedding model loaded.")
 
 
 # ============================================================
-# CONNECT TO CHROMADB
+# CONNECT TO CHROMA CLOUD
 # ============================================================
 
-print("Connecting to ChromaDB...")
+print("Connecting to Chroma Cloud...")
 
-client_db = chromadb.PersistentClient(
-    path=CHROMA_PATH
+client_db = chromadb.CloudClient(
+    tenant=CHROMA_TENANT,
+    database=CHROMA_DATABASE,
+    api_key=CHROMA_API_KEY
 )
 
 collection = client_db.get_or_create_collection(
@@ -57,7 +91,7 @@ collection = client_db.get_or_create_collection(
 )
 
 print(
-    "Collection:",
+    "Cloud collection:",
     collection.name,
     "| items:",
     collection.count()
@@ -182,8 +216,6 @@ def is_reference_heavy(text):
         if word in text_lower:
             score += 1
 
-    # Only reject extremely short chunks
-    # if they are basically empty.
     if len(text.strip()) < 30:
         score += 1
 
@@ -204,7 +236,6 @@ def retrieve(
         normalize_embeddings=True
     )
 
-    # Retrieve many candidates first
     candidate_count = max(
         RETRIEVAL_CANDIDATES,
         top_k
@@ -324,22 +355,12 @@ def retrieve(
         })
 
     # --------------------------------------------------------
-    # IMPORTANT:
-    #
-    # ChromaDB returns DISTANCE.
-    #
-    # Smaller distance = closer result.
-    #
-    # Therefore we sort ascending.
+    # Smaller distance = closer result
     # --------------------------------------------------------
 
     retrieved.sort(
         key=lambda x: x["distance"]
     )
-
-    # --------------------------------------------------------
-    # Return FIVE closest chunks.
-    # --------------------------------------------------------
 
     return retrieved[:top_k]
 
@@ -786,11 +807,7 @@ def build_results(
             )
 
         # ----------------------------------------------------
-        # ChromaDB uses distance:
-        #
-        # Smaller distance = more similar
-        #
-        # Convert it to a similarity score.
+        # Smaller distance = higher similarity
         # ----------------------------------------------------
 
         distance = float(
@@ -847,24 +864,7 @@ def build_results(
         })
 
     # --------------------------------------------------------
-    # MOST IMPORTANT PART
-    #
-    # Highest similarity first.
-    # Therefore:
-    #
-    # 0.90
-    # 0.80
-    # 0.70
-    # 0.60
-    # 0.50
-    #
-    # NOT:
-    #
-    # 0.50
-    # 0.60
-    # 0.70
-    # 0.80
-    # 0.90
+    # Highest similarity first
     # --------------------------------------------------------
 
     results.sort(
@@ -873,7 +873,7 @@ def build_results(
     )
 
     # --------------------------------------------------------
-    # Re-number ranks after sorting
+    # Re-number ranks
     # --------------------------------------------------------
 
     for index, result in enumerate(
@@ -895,7 +895,7 @@ def run_pipeline(query):
     query = query.strip()
 
     # --------------------------------------------------------
-    # 1. RETRIEVE TOP 5
+    # 1. RETRIEVE TOP 5 FROM CHROMA CLOUD
     # --------------------------------------------------------
 
     retrieved = retrieve(
@@ -975,8 +975,6 @@ def run_pipeline(query):
 
     # --------------------------------------------------------
     # 4. KNOWLEDGE BASE GATE
-    #
-    # Only BEST match must pass threshold.
     # --------------------------------------------------------
 
     if (
@@ -1188,13 +1186,11 @@ def run_pipeline(query):
 
     parsed["top_distance"] = distance
 
-    # --------------------------------------------------------
     # Valid question:
     # ALWAYS return TOP 5 source chunks.
     #
     # Invalid/outside question:
     # return 0 results.
-    # --------------------------------------------------------
 
     if parsed["refused"]:
 
@@ -1227,6 +1223,21 @@ if __name__ == "__main__":
 
     print(
         "==============================\n"
+    )
+
+    print(
+        "Chroma Cloud database:",
+        CHROMA_DATABASE
+    )
+
+    print(
+        "Collection:",
+        collection.name
+    )
+
+    print(
+        "Collection items:",
+        collection.count()
     )
 
     test_question = (
