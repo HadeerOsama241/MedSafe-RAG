@@ -74,7 +74,7 @@ function AIAssistant() {
       // =================================================
 
       const response = await fetch(
-        'https://click-defense-handle-pilot.trycloudflare.com/api/chat',
+        'https://consoles-nickname-mechanics-dinner.trycloudflare.com/api/chat',
         {
           method: 'POST',
 
