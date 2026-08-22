@@ -476,3 +476,11 @@ Citation-Grounded RAG Chatbot for Medication Safety based on WHO Guidelines.
 Built using:
 
 React + Flask + ChromaDB + Sentence Transformers + Ollama
+
+
+## 👥 Team Members
+
+- Hadeer Osama
+- Arwa Sameh
+- Shahd Abdelnaby
+- Hadeer Abdalsattar
